@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import re
 import time
 from collections import Counter
 from typing import Optional, Tuple
@@ -35,6 +36,11 @@ AGREEMENT_TO_CONFIG = {
     "66agree": "sentences_66agree",
     "50agree": "sentences_50agree",
 }
+
+DATASET_CANDIDATES = [
+    "takala/financial_phrasebank",
+    "financial_phrasebank",
+]
 
 
 # ======================
@@ -105,18 +111,61 @@ def predict_label(client: OpenAI, sentence: str, model: str, debug=False) -> Tup
 # ======================
 # DATA LOADING
 # ======================
-def load_financial_phrasebank(agreement_level: str):
+def load_financial_phrasebank(agreement_level: str, allow_fallback: bool = True):
     if agreement_level not in AGREEMENT_TO_CONFIG:
         valid = ", ".join(sorted(AGREEMENT_TO_CONFIG.keys()))
         raise ValueError(f"Unsupported agreement level: {agreement_level}. Valid values: {valid}")
 
     config_name = AGREEMENT_TO_CONFIG[agreement_level]
-    ds = load_dataset(
-        "takala/financial_phrasebank",
-        config_name,
-        trust_remote_code=True
+
+    # trust_remote_code has been removed in recent datasets versions.
+    # Try both hub IDs to handle renamed/migrated dataset repos.
+    errors = []
+    for dataset_id in DATASET_CANDIDATES:
+        try:
+            ds = load_dataset(dataset_id, config_name)
+            return ds["train"], config_name, dataset_id
+        except Exception as e:
+            errors.append((dataset_id, str(e)))
+
+    # If only allagree exists in local cache, fall back with a warning.
+    requested = config_name
+    fallback = AGREEMENT_TO_CONFIG["allagree"]
+    cache_config_error = next(
+        (
+            msg
+            for _, msg in errors
+            if "Available configs in the cache" in msg and requested in msg
+        ),
+        None,
     )
-    return ds["train"]
+    if allow_fallback and cache_config_error:
+        match = re.search(r"Available configs in the cache:\s*\[(.*)\]", cache_config_error)
+        available_text = match.group(1) if match else ""
+        if fallback in available_text:
+            print(
+                f"[WARN] Requested config '{requested}' is not in local cache. "
+                f"Falling back to '{fallback}'."
+            )
+            for dataset_id in DATASET_CANDIDATES:
+                try:
+                    ds = load_dataset(dataset_id, fallback)
+                    return ds["train"], fallback, dataset_id
+                except Exception:
+                    pass
+
+    detail = "\n\n".join([f"- {dataset_id}: {msg}" for dataset_id, msg in errors])
+    raise RuntimeError(
+        "Failed to load Financial PhraseBank with the requested agreement level.\n"
+        "Tips:\n"
+        "1. Remove trust_remote_code (already handled in this script).\n"
+        "2. If you are offline and cache only has allagree, run: --agreement-level allagree\n"
+        "3. If you need 75/66/50agree, reconnect network and retry once to download cache.\n"
+        "4. To fail fast instead of fallback, use: --no-fallback\n"
+        f"Requested config: {requested}\n"
+        f"Tried dataset IDs: {', '.join(DATASET_CANDIDATES)}\n"
+        f"Underlying errors:\n{detail}"
+    )
 
 
 # ======================
@@ -128,6 +177,7 @@ def evaluate(
     max_samples: Optional[int],
     seed: int,
     sleep_seconds: float,
+    allow_fallback: bool,
     debug=False,
 ) -> None:
     load_dotenv()
@@ -137,7 +187,10 @@ def evaluate(
 
     client = OpenAI(base_url="https://aihubmix.com/v1",api_key=api_key,)
 
-    dataset = load_financial_phrasebank(agreement_level=agreement_level)
+    dataset, loaded_config, loaded_dataset_id = load_financial_phrasebank(
+        agreement_level=agreement_level,
+        allow_fallback=allow_fallback,
+    )
     rows = list(dataset)
 
     if max_samples is not None and max_samples < len(rows):
@@ -189,7 +242,9 @@ def evaluate(
 
     print("\n=== Evaluation Result ===")
     print(f"Model: {model}")
-    print(f"PhraseBank split: {AGREEMENT_TO_CONFIG[agreement_level]}")
+    print(f"PhraseBank split requested: {AGREEMENT_TO_CONFIG[agreement_level]}")
+    print(f"PhraseBank split loaded: {loaded_config}")
+    print(f"Dataset ID used: {loaded_dataset_id}")
     print(f"Total samples requested: {len(rows)}")
     print(f"Valid predictions: {len(y_true)}")
     print(f"Invalid predictions: {invalid_count}")
@@ -256,6 +311,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help="Disable automatic fallback to allagree when requested split is missing in local cache.",
+    )
     parser.add_argument("--debug", action="store_true")  # 👈 新增debug模式
     return parser.parse_args()
 
@@ -268,5 +328,6 @@ if __name__ == "__main__":
         max_samples=args.max_samples,
         seed=args.seed,
         sleep_seconds=args.sleep_seconds,
+        allow_fallback=not args.no_fallback,
         debug=args.debug
     )
