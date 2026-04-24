@@ -19,6 +19,7 @@ All model types should connect to the same metric module: `sentiment_metrics.py`
 - `sentiment_metrics.py`: Shared metric engine. Computes confusion matrix, per-class precision/recall/F1, macro-F1, S-MAE, and efficiency statistics.
 - `requirements.txt`: Python dependencies.
 - `README.md`: Project documentation and integration guidance.
+- `traditional_approaches.ipynb`: Applying traditional ML methods, namely Naive Bayes, logistic regression and SVM to the dataset. Computes confusion matrix, per-class precision/recall/F1
 
 ## Unified Metrics (for all models)
 
