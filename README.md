@@ -75,8 +75,14 @@ pip install datasets==2.19.0
 
 ```bash
 copy .env.example .env
-# then edit .env and set OPENAI_API_KEY
+# then edit .env and set at least one provider key:
+# OPENAI_API_KEY or DEEPSEEK_API_KEY
 ```
+
+Provider-related env vars:
+
+- `OPENAI_API_KEY`, optional `OPENAI_BASE_URL` (default: `https://aihubmix.com/v1`)
+- `DEEPSEEK_API_KEY`, optional `DEEPSEEK_BASE_URL` (default: `https://api.deepseek.com/v1`)
 
 ## Run
 
@@ -85,6 +91,21 @@ Evaluate all samples:
 ```bash
 python gpt_based_method.py
 ```
+
+Select provider/model with `--` arguments:
+
+```bash
+# OpenAI
+python gpt_based_method.py --provider openai --model gpt-3.5-turbo
+
+# DeepSeek
+python gpt_based_method.py --provider deepseek --model deepseek-v4-flash
+```
+
+Notes:
+
+- `--max-output-tokens` default is provider-aware: `openai=32`, `deepseek=64`.
+- The script auto-retries once with a stricter prompt when a prediction is `invalid`.
 
 Choose PhraseBank agreement level (default is `allagree`):
 
@@ -98,7 +119,7 @@ python gpt_based_method.py --agreement-level 50agree
 Evaluate a quick subset (for cheaper/faster testing):
 
 ```bash
-python gpt_based_method.py --agreement-level allagree --max-samples 100
+python gpt_based_method.py --provider openai --model gpt-3.5-turbo --agreement-level allagree --max-samples 100
 ```
 
 Fail fast when the requested split is unavailable (instead of auto fallback):
@@ -126,7 +147,7 @@ Expected train sizes:
 The GPT evaluation script prints:
 
 - Dataset and validity stats
-- Accuracy, Macro-F1, S-MAE
+- Accuracy, Macro-F1, S-MAE (computed on valid predictions only)
 - Per-class Precision / Recall / F1
 - Confusion matrix
 - GPT efficiency metrics (latency + token totals)

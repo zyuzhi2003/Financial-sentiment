@@ -30,6 +30,11 @@ SYSTEM_PROMPT = (
     "Do NOT output anything else."
 )
 
+STRICT_SYSTEM_PROMPT = (
+    "You are a financial sentiment classifier. "
+    "Return exactly one word from this set: positive, negative, neutral."
+)
+
 AGREEMENT_TO_CONFIG = {
     "allagree": "sentences_allagree",
     "75agree": "sentences_75agree",
@@ -41,6 +46,19 @@ DATASET_CANDIDATES = [
     "takala/financial_phrasebank",
     "financial_phrasebank",
 ]
+
+PROVIDER_CONFIG = {
+    "openai": {
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url_env": "OPENAI_BASE_URL",
+        "default_base_url": "https://aihubmix.com/v1",
+    },
+    "deepseek": {
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "base_url_env": "DEEPSEEK_BASE_URL",
+        "default_base_url": "https://api.deepseek.com/v1",
+    },
+}
 
 
 # ======================
@@ -68,27 +86,45 @@ def get_true_label(row):
 # ======================
 # MODEL CALL
 # ======================
-def predict_label(client: OpenAI, sentence: str, model: str, debug=False) -> Tuple[str, InferenceRecord]:
+def predict_label(
+    client: OpenAI,
+    sentence: str,
+    model: str,
+    max_output_tokens: int,
+    strict: bool = False,
+    debug=False,
+) -> Tuple[str, InferenceRecord]:
+    system_prompt = STRICT_SYSTEM_PROMPT if strict else SYSTEM_PROMPT
+    user_content = (
+        f"Text: {sentence}\nLabel:"
+        if strict
+        else (
+            "Sentence: "
+            f"{sentence}\n\n"
+            "Return only one word."
+        )
+    )
+
     start = time.perf_counter()
     response = client.chat.completions.create(
         model=model,
         temperature=0,
-        max_tokens=3,
+        max_tokens=max_output_tokens,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    "Sentence: "
-                    f"{sentence}\n\n"
-                    "Return only one word."
-                ),
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
         ],
     )
     end = time.perf_counter()
 
-    text = response.choices[0].message.content or ""
+    choice = response.choices[0]
+    message = choice.message
+    text = (message.content or "").strip()
+    reasoning_text = (getattr(message, "reasoning_content", None) or "").strip()
+
+    # Some reasoning-style APIs may leave content empty; use reasoning text as fallback.
+    if not text and reasoning_text:
+        text = reasoning_text
 
     usage = getattr(response, "usage", None)
     prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
@@ -103,9 +139,25 @@ def predict_label(client: OpenAI, sentence: str, model: str, debug=False) -> Tup
     )
 
     if debug:
-        print("RAW OUTPUT:", text)
+        prefix = "RAW OUTPUT (retry):" if strict else "RAW OUTPUT:"
+        print(prefix, text)
+        if not text:
+            print(
+                "DEBUG: empty content",
+                {
+                    "finish_reason": getattr(choice, "finish_reason", None),
+                    "completion_tokens": completion_tokens,
+                },
+            )
 
     return normalize_label(text), record
+
+
+def resolve_max_output_tokens(provider: str, user_value: Optional[int]) -> int:
+    if user_value is not None:
+        return user_value
+    # DeepSeek models often prepend reasoning text; give them a bit more headroom by default.
+    return 64 if provider == "deepseek" else 32
 
 
 # ======================
@@ -168,11 +220,27 @@ def load_financial_phrasebank(agreement_level: str, allow_fallback: bool = True)
     )
 
 
+def build_client(provider: str) -> OpenAI:
+    if provider not in PROVIDER_CONFIG:
+        valid = ", ".join(sorted(PROVIDER_CONFIG.keys()))
+        raise ValueError(f"Unsupported provider: {provider}. Valid values: {valid}")
+
+    cfg = PROVIDER_CONFIG[provider]
+    api_key = os.getenv(cfg["api_key_env"])
+    if not api_key:
+        raise RuntimeError(f"{cfg['api_key_env']} not found.")
+
+    base_url = os.getenv(cfg["base_url_env"], cfg["default_base_url"])
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
 # ======================
 # EVALUATION
 # ======================
 def evaluate(
+    provider: str,
     model: str,
+    max_output_tokens: Optional[int],
     agreement_level: str,
     max_samples: Optional[int],
     seed: int,
@@ -181,11 +249,8 @@ def evaluate(
     debug=False,
 ) -> None:
     load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not found.")
-
-    client = OpenAI(base_url="https://aihubmix.com/v1",api_key=api_key,)
+    client = build_client(provider)
+    max_output_tokens = resolve_max_output_tokens(provider, max_output_tokens)
 
     dataset, loaded_config, loaded_dataset_id = load_financial_phrasebank(
         agreement_level=agreement_level,
@@ -203,6 +268,7 @@ def evaluate(
     inference_records = []
     invalid_count = 0
     errors = 0
+    retry_successes = 0
 
     for row in tqdm(rows, desc="Evaluating"):
         sentence = row["sentence"]
@@ -210,7 +276,13 @@ def evaluate(
 
 
         try:
-            pred, info = predict_label(client, sentence, model=model, debug=debug)
+            pred, info = predict_label(
+                client,
+                sentence,
+                model=model,
+                max_output_tokens=max_output_tokens,
+                debug=debug,
+            )
         except Exception as e:
             if debug:
                 print("ERROR:", e)
@@ -219,8 +291,28 @@ def evaluate(
             errors += 1
 
         if pred == "invalid":
-            invalid_count += 1
-            continue
+            try:
+                retry_pred, retry_info = predict_label(
+                    client,
+                    sentence,
+                    model=model,
+                    max_output_tokens=min(max_output_tokens, 16),
+                    strict=True,
+                    debug=debug,
+                )
+                if retry_pred != "invalid":
+                    pred = retry_pred
+                    info = retry_info
+                    retry_successes += 1
+                else:
+                    invalid_count += 1
+                    continue
+            except Exception as e:
+                if debug:
+                    print("RETRY ERROR:", e)
+                invalid_count += 1
+                errors += 1
+                continue
 
         y_true.append(true_label)
         y_pred.append(pred)
@@ -231,7 +323,13 @@ def evaluate(
             time.sleep(sleep_seconds)
 
     if not y_true:
-        raise RuntimeError("No valid predictions collected; cannot compute accuracy.")
+        raise RuntimeError(
+            "No valid predictions collected; cannot compute accuracy. "
+            f"provider={provider}, model={model}, total_samples={len(rows)}, "
+            f"invalid_predictions={invalid_count}, api_errors={errors}. "
+            "If using a DeepSeek reasoning model, try a chat model like deepseek-chat "
+            "or increase --max-output-tokens (e.g., 32 or 64), and re-run with --debug."
+        )
 
     metrics = compute_all_metrics(
         y_true=y_true,
@@ -241,17 +339,22 @@ def evaluate(
     )
 
     print("\n=== Evaluation Result ===")
+    print(f"Provider: {provider}")
     print(f"Model: {model}")
+    print(f"Max output tokens: {max_output_tokens}")
     print(f"PhraseBank split requested: {AGREEMENT_TO_CONFIG[agreement_level]}")
     print(f"PhraseBank split loaded: {loaded_config}")
     print(f"Dataset ID used: {loaded_dataset_id}")
     print(f"Total samples requested: {len(rows)}")
     print(f"Valid predictions: {len(y_true)}")
     print(f"Invalid predictions: {invalid_count}")
+    print(f"Retry recovered: {retry_successes}")
     print(f"API errors: {errors}")
-    print(f"Accuracy: {metrics['accuracy']:.4f}")
-    print(f"Macro-F1: {metrics['macro_f1']:.4f}")
-    print(f"S-MAE: {metrics['s_mae']:.4f}")
+    print(f"Valid coverage: {len(y_true) / len(rows):.4f} ({len(y_true)}/{len(rows)})")
+    print(f"Metrics denominator: valid predictions only (N={len(y_true)})")
+    print(f"Accuracy (valid-only): {metrics['accuracy']:.4f}")
+    print(f"Macro-F1 (valid-only): {metrics['macro_f1']:.4f}")
+    print(f"S-MAE (valid-only): {metrics['s_mae']:.4f}")
 
     print("\nPer-class metrics:")
     for label, stats in metrics["per_class"].items():
@@ -301,7 +404,19 @@ def evaluate(
 # ======================
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--provider",
+        choices=sorted(PROVIDER_CONFIG.keys()),
+        default="openai",
+        help="API provider to use: openai or deepseek.",
+    )
     parser.add_argument("--model", default="gpt-3.5-turbo")
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help="Max output tokens for one prediction request (default: openai=32, deepseek=64).",
+    )
     parser.add_argument(
         "--agreement-level",
         choices=sorted(AGREEMENT_TO_CONFIG.keys()),
@@ -323,7 +438,9 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     evaluate(
+        provider=args.provider,
         model=args.model,
+        max_output_tokens=args.max_output_tokens,
         agreement_level=args.agreement_level,
         max_samples=args.max_samples,
         seed=args.seed,
