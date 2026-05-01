@@ -19,7 +19,7 @@ All model types should connect to the same metric module: `sentiment_metrics.py`
 - `sentiment_metrics.py`: Shared metric engine. Computes confusion matrix, per-class precision/recall/F1, macro-F1, S-MAE, and efficiency statistics.
 - `requirements.txt`: Python dependencies.
 - `README.md`: Project documentation and integration guidance.
-- `traditional_approaches.ipynb`: Applying traditional ML methods, namely Naive Bayes, logistic regression and SVM to the dataset. Computes confusion matrix, per-class precision/recall/F1
+- `NVB_LR.ipynb`: Applying traditional ML methods, namely Naive Bayes, logistic regression and SVM to the dataset. Computes confusion matrix, per-class precision/recall/F1
 - `lightgbm xgboost.py`: Implements LightGBM and XGBoost models using TF-IDF features, and evaluates them with the shared `compute_all_metrics` framework (accuracy, macro-F1, per-class metrics, confusion matrix, S-MAE).
 
 ## Unified Metrics (for all models)
